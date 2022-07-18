@@ -1,0 +1,419 @@
+---
+title: "MIBI cell clustering"
+author: "SJ & YYY"
+date: "06/23/2022"
+output: html_document
+---
+
+## R Markdown
+This markdown is to generate cell clustering maps from cellular features extracted from CODEX.
+Before starting, install these packages if necessary:
+
+BiocManager::install(c("FlowSOM", "MetaCyto", "Biobase", "EBImage", "limma"))
+install.packages(c("matrixStats", "ggplot2", "reshape2", "dplyr", "ggrepel", "RColorBrewer", "pheatmap", "ConsensusClusterPlus", "tidyverse", "Rtsne", "uwot", "ComplexHeatmap", "bioimagetools", "magick"))
+install.packages("remotes")
+remotes::install_github("JonathanIrish/MEMv3")
+remotes::install_github("jmw86069/jamba")
+
+```{r, echo=FALSE, warning=FALSE, error=FALSE}
+#Import these libraries. They are needed to operate cell clustering.
+#Remember to change the "source" file directory to where the MIBI_functions.R is located
+library(flowCore)
+library(R.matlab)
+library(FlowSOM)
+library(MetaCyto)
+library(matrixStats)
+library(ggplot2)
+library(reshape2)
+library(dplyr)
+library(limma)
+library(ggrepel)
+library(RColorBrewer)
+library(pheatmap)
+library(ConsensusClusterPlus)
+library(Biobase)
+library(MEM)
+library(tidyverse)
+library(Rtsne)
+library(uwot)
+library(ComplexHeatmap)
+library(bioimagetools)
+library(magick)
+library(EBImage)
+library(jamba)
+library(patchwork)
+source("/       [directory]        /MIBI_functions.R") # please update directory 
+```
+
+Import .fcs file after cell feature extraction
+```{r}
+# Set file directory
+directory = "/Users/Desktop/dataScaleSize.fcs"
+
+# Import file
+fcs_no_trans = read.flowSet(files = directory, transformation = F, truncate_max_range = F)
+fcs_no_trans
+```
+
+Make sure that every cell has nucleus.
+```{r}
+# exprs retrieves expression data and returns a large matrix of expression values
+expr_notrans = fsApply(fcs_no_trans, exprs)
+
+# Check that every cell has nuclear signal. If the value returns "0", it means that there are no cells with no nuclear signal.
+sum(expr_notrans[, "Histone H3"] == 0)
+```
+
+Rename channel names if necessary
+```{r}
+# set file directory for channel names
+channel_names = read.csv('/Users/channelNames_analysis.csv')
+
+# actual data column starts at column #3
+for (col in 3:ncol(expr_notrans)){
+  colnames(expr_notrans)[col] <- channel_names[col-2,1] # the first 2 columns are cellLabel and cellArea
+  }
+
+# append "PointNum" column
+PointNum = rep(c(1), each=nrow(expr_notrans))
+expr_notrans = cbind(expr_notrans, PointNum)
+
+colnames(expr_notrans)
+```
+
+Set nuclear normalization parameters.
+```{r}
+# Set normalization channel and cutoff signal; the prevailing assumption is that norm_channel signal should be generally consistent across diff FOVs
+norm_channel = "Histone H3"
+cutoff = 0.1
+
+# Exclude cells that have nucleus below the cutoff
+expr_notrans_filter = expr_notrans[expr_notrans[, norm_channel] > cutoff, , drop=F]
+
+# Check the number of cells in the original vs. the filtered file.
+dim(expr_notrans)
+dim(expr_notrans_filter)
+```
+
+Normalize all channels to nucleus by dividing each signal with the median nuclear signal
+```{r}
+# Perform normalization to the median nuclear signal (exclude cellLabelInImage, cellSize, PointNum)
+
+# Exclude "PointNum" column
+normChannels = ncol(expr_notrans)-1
+
+# Normalize for each PointNum. Usually, each "PointNum" refers to a new imaging dataset, but here the "PointNum" = 1
+expr_notrans_filter_medianNucleus = list()
+for(i in 1:max(expr_notrans_filter[,"PointNum"])){
+  w = which(expr_notrans_filter[,"PointNum"] == i)
+  df = expr_notrans_filter[w,]
+  df[,3:normChannels] = df[,3:normChannels]/(median(df[,norm_channel])) # exclude cellLabelInImage and cellSize columns
+  expr_notrans_filter_medianNucleus[[i]] = df
+  }
+
+expr_notrans_filter_medianNucleus = do.call(
+  rbind, lapply(expr_notrans_filter_medianNucleus, function(x){return(x)})
+  )
+
+# Show number of cells after normalization, as well as the before/after normalization values
+head(expr_notrans_filter)
+head(expr_notrans_filter_medianNucleus)
+```
+
+Perform arcsinh data transformation and percentile cutoff + scaling (from 0 - 1)
+```{r}
+# Adjust "cofactor" to change arcsinh transformation. 
+cofactor = 5
+
+# Perform arcsine transformation
+expr_notrans_filter_medianNucleus[,3:normChannels] = asinh(expr_notrans_filter_medianNucleus[,3:normChannels]/cofactor)
+expr_notrans_filter_medianNucleus_original = expr_notrans_filter_medianNucleus
+
+# Set percentile (two-sided cutoff)
+percentile = 99
+
+# Determine percentile range
+percentileBot = 1-percentile/100
+percentileTop = percentile/100
+
+range = colQuantiles(
+  expr_notrans_filter_medianNucleus[, 3:normChannels], # exclude cellLabelinImage, cellSize, PointNum
+  probs = c(percentileBot, percentileTop))
+
+# Scale the data accordingly
+expr = t((t(expr_notrans_filter_medianNucleus[, 3:normChannels])-range[,1]) / (range[,2]-range[,1]))
+expr[expr<0] = 0
+expr[expr>1] = 1
+
+# Add back cellLabelinImage, cellSize, and PointNum columns
+expr_notrans_filter_medianNucleus[,3:normChannels] = expr
+
+head(expr_notrans_filter_medianNucleus_original)
+head(expr_notrans_filter_medianNucleus)
+```
+
+Plot graphs for unscaled and scaled data. A "tip" at the x = 1 is indicative of positive signals
+```{r, fig.width=9, fig.height=9}
+# Unscaled data
+ggdf_original = data.frame(expr_notrans_filter_medianNucleus_original)
+ggdf_original = melt(ggdf_original, id.var = "PointNum",
+                     value.name = "expression",
+                     variable.name = "antigen")
+ggdf_original$PointNum = as.factor(ggdf_original$PointNum)
+g_original = ggplot(ggdf_original, aes(x = expression, color = PointNum, group = PointNum))
+
+# Custom palette for unscaled data graph
+getPalette = colorRampPalette(brewer.pal(9, "Set1"))
+g_original + geom_density() + facet_wrap(~ antigen, nrow = 10, scales = "free") + theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        strip.text = element_text(size = 10), 
+        axis.text = element_text(size = 10)) + 
+  scale_fill_manual(values=getPalette(length(unique(ggdf_original$PointNum))))
+
+
+# Scaled data
+ggdf = data.frame(expr_notrans_filter_medianNucleus)
+ggdf = melt(ggdf, id.var = "PointNum",
+            value.name = "expression",
+            variable.name = "antigen")
+ggdf$PointNum = as.factor(ggdf$PointNum)
+g = ggplot(ggdf, aes(x = expression, color = PointNum, group = PointNum))
+
+# Custom palette for scaled data graph
+getPalette = colorRampPalette(brewer.pal(9, "Set1"))
+g + geom_density() + facet_wrap(~ antigen, nrow = 10, scales = "free") + theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        strip.text = element_text(size = 10), 
+        axis.text = element_text(size = 10)) + 
+  scale_fill_manual(values=getPalette(length(unique(ggdf$PointNum))))
+```
+
+Select markers to be used for UMAP. USE ONLY SELECTED MARKERS FOR PHENOTYPING, NOT ALL MARKERS!
+```{r}
+# Select the markers; do not include cellLabelInImage, cellSize, nucleus, PointNum.
+# Use colnames(expr_adjusted_df) to facilitate the search for columns.
+
+# colnames(expr_adjusted_df)
+umap.markers = expr_adjusted_df[, c("marker1","marker2","marker3","...")]
+
+colnames(umap.markers)
+umap.markers
+```
+
+Perform UMAP and generate UMAP plot
+```{r run_UMAP, fig.height=8, fig.width=10}
+## Getting colors here
+values = c(brewer.pal(n = 9, name = "Set1"), brewer.pal(n = 12, name = "Paired"), brewer.pal(n = 8, name = "Set2"),
+           brewer.pal(n = 8, name = "Dark2"), brewer.pal(n = 12, name = "Set3"), brewer.pal(n = 8, name = "Accent") )
+
+# Run UMAP on the chosen markers above
+set.seed(1)
+myumap <- umap(umap.markers, 
+               ret_model = TRUE, 
+               verbose = TRUE)
+umap.data = as.data.frame(myumap$embedding)   # pull out umap values from 'myumap' into a dataframe
+colnames(umap.data) <- c("UMAP1", "UMAP2")    # assign column names to umap.data
+range <- apply(apply(umap.data, 2, range), 2, diff)
+graphical.ratio <- (range[1]/range[2])
+
+# Generate UMAP flat dotplot and density dotplot (1 dot = 1 cell)
+UMAP.plot <- data.frame(x = umap.data[,1], y = umap.data[,2])
+## flat dotplot
+ggplot(UMAP.plot) + 
+  coord_fixed(ratio=graphical.ratio) + 
+  geom_point(aes(x=x, y=y), cex = 1) + 
+  labs(x = "UMAP 1", y = "UMAP 2") + theme_bw()
+## density dotplot
+ggplot(UMAP.plot, aes(x=x, y=y)) + 
+  coord_fixed(ratio = graphical.ratio) + 
+  geom_bin2d(bins = 128) + 
+  scale_fill_viridis_c(option = "A", trans = "sqrt") + 
+  scale_x_continuous(expand = c(0.1,0)) + 
+  scale_y_continuous(expand = c(0.1,0)) + 
+  labs(x = "UMAP 1", y = "UMAP 2") + theme_bw()
+
+# Color by FOV
+PointNum = factor(expr_adjusted_df[,"PointNum"], 
+                  levels = unique(expr_adjusted_df[,"PointNum"])[
+                    mixedOrder(unique(expr_adjusted_df[,"PointNum"]))])
+
+# Plot UMAP
+ggplot(UMAP.plot) + coord_fixed(ratio=graphical.ratio) + 
+  geom_point(aes(x=x, y=y, color=PointNum),cex = 0.5) + 
+  guides(colour = guide_legend(override.aes = list(size=5), nrow = 13)) +
+  labs(x = "UMAP 1", y = "UMAP 2" ,title = "FlowSOM Clustering on UMAP Axes", color = "FOV") + 
+  theme_bw() + scale_color_manual(values = values)
+```
+
+UMAP plotting for each marker
+```{r, fig.height=5, fig.width=10}
+# Generate complete data: filtered data + umap data
+full_umap = cbind(umap.markers, umap.data)
+
+# Make list of plots
+channel_to_plot = colnames(full_umap)
+## unscaled
+per_channel_list1 = lapply(channel_to_plot, function(channel){
+  print(channel)
+  plot_gradient_mean(full_umap, channel, midscale = F)
+  })
+names(per_channel_list1) = channel_to_plot
+## scaled
+per_channel_list2 = lapply(channel_to_plot, function(channel){
+  plot_gradient_mean(full_umap, channel, midscale = T)
+  })
+names(per_channel_list2) = channel_to_plot
+
+# Assemble with wrap_plots()
+require(patchwork) # require is generally used inside functions
+wrap_plots(per_channel_list1, ncol = 5)
+wrap_plots(per_channel_list2, ncol = 5)
+```
+
+Perform FlowSOM clustering based on the UMAP axes; therefore, one should have already done UMAP based on the selected markers
+```{r run_FlowSOM_on_UMAP, fig.height=8, fig.width=8}
+# Enter target number of clusters
+target.clusters = 50
+
+# Running flowsom on the actual selected markers, instead of the UMAP reduced dimensions
+flowsom_markers = umap.markers
+colnames(flowsom_markers)
+mat <- as.matrix(flowsom_markers)
+
+# Create flowFrame for FlowSOM input
+metadata <- data.frame(name = dimnames(mat)[[2]],
+                       desc = dimnames(mat)[[2]])
+metadata$range <- apply(apply(mat, 2, range), 2, diff)
+metadata$minRange <- apply(mat, 2, min)
+metadata$maxRange <- apply(mat, 2, max)
+input.flowframe <- new("flowFrame",
+                       exprs = mat,
+                       parameters = AnnotatedDataFrame(metadata))
+
+# Implement FlowSOM on the data
+fsom <- FlowSOM(input.flowframe,
+                colsToUse = c(1:dim(input.flowframe)[2]),
+                nClus = target.clusters,
+                seed = 1
+                )
+
+# This gets the cluster information for each cell
+FlowSOM.clusters <- GetMetaclusters(fsom)
+#FlowSOM.clusters <- as.matrix(fsom[[2]][fsom[[1]]$map$mapping[, 1]])
+
+# Color palette
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, 
+                           rownames(qual_col_pals)))
+col_vector = col_vector[-c(4,17,19,27,29:45)]
+values = sample(col_vector)
+
+# Merge FlowSOM clusters on UMAP axes
+umap.cent = cbind(UMAP.plot, FlowSOM.clusters) %>% 
+  group_by(FlowSOM.clusters) %>% 
+  summarize_all(mean)
+
+# This allows the cluster to be plotted in numeric order
+FlowSOM.clusters <- factor(FlowSOM.clusters, 
+                           levels = unique(FlowSOM.clusters)[mixedOrder(unique(FlowSOM.clusters))])
+
+# Plot flowsom clusters
+##plot a figure with cluster names outside
+ggplot(UMAP.plot) + coord_fixed(ratio=graphical.ratio) + 
+  geom_point(aes(x=x, y=y, color=FlowSOM.clusters), cex = 1.5) + 
+  guides(colour = guide_legend(override.aes = list(size=5), nrow = 13)) +
+  labs(x = "UMAP 1", y = "UMAP 2", 
+       title = "FlowSOM Clustering on UMAP Axes", 
+       color = "FlowSOM Cluster") + 
+  theme_bw() + scale_color_manual(values = values)
+##plot a figure with cluster names embedded in the figure
+ggplot(UMAP.plot) + coord_fixed(ratio=graphical.ratio) + 
+  geom_point(aes(x=x, y=y, color=FlowSOM.clusters), cex = 1.5) + 
+  guides(colour = guide_legend(override.aes = list(size=5), nrow = 13)) +
+  labs(x = "UMAP 1", y = "UMAP 2",
+       title = "FlowSOM Clustering on UMAP Axes", 
+       color = "FlowSOM Cluster") + 
+  theme_bw() + scale_color_manual(values = values) + 
+  geom_label_repel(data = umap.cent, aes(x = x, y = y, label = FlowSOM.clusters)) + 
+  theme(legend.position = "none")
+```
+
+Marker Enrichment Modeling: creates quantitative identity labels based on features enriched in a population (relative to a reference population). 
+```{r MEM, fig.height=5, fig.width=5}
+# Run MEM on the FlowSOM clusters dervied from UMAP axes
+cluster = as.numeric(as.vector((FlowSOM.clusters)))
+MEM.data = cbind(flowsom_markers, cluster)
+MEM.data_df = data.frame(MEM.data)
+
+# Scale zero = off (zero.ref = FALSE)
+MEM.values.uf_zeroOFF = MEM(
+  MEM.data_df,
+  transform = FALSE,
+  cofactor = 0,
+  choose.markers = FALSE,
+  markers = "all",
+  choose.ref = FALSE,
+  zero.ref = FALSE,
+  rename.markers = FALSE,
+  new.marker.names = "none",
+  file.is.clust = FALSE,
+  add.fileID = FALSE,
+  IQR.thresh = NULL
+  )
+
+# build MEM heatmap and output enrichment scores
+build.heatmaps(
+  MEM.values.uf_zeroOFF,
+  cluster.MEM = "both",
+  cluster.medians = "none",
+  cluster.IQRs = "none",
+  display.thresh = 1,
+  newWindow.heatmaps = F,
+  output.files = T,
+  labels = T,
+  only.MEMheatmap = T
+  )
+
+# Scale zero = on (zero.ref = TRUE)
+MEM.values.uf_zeroON = MEM(
+  MEM.data_df,
+  transform = FALSE,
+  cofactor = 0,
+  choose.markers = FALSE,
+  markers = "all",
+  choose.ref = FALSE,
+  zero.ref = TRUE,
+  rename.markers = FALSE,
+  new.marker.names = "none",
+  file.is.clust = FALSE,
+  add.fileID = FALSE,
+  IQR.thresh = NULL
+  )
+
+# build MEM heatmap and output enrichment scores
+build.heatmaps(
+  MEM.values.uf_zeroON,
+  cluster.MEM = "both",
+  cluster.medians = "none",
+  cluster.IQRs = "none",
+  display.thresh = 1,
+  newWindow.heatmaps = F,
+  output.files = T,
+  labels = T,
+  only.MEMheatmap = T
+  )
+
+MEM.data_df
+```
+
+Export cluster values; here, visually check and annotate each cell
+```{r}
+# Select table
+cell_cluster = cbind(expr_adjusted_df$Ch.1,MEM.data_df$cluster)
+colnames(cell_cluster) = c("cellID", "cluster")
+head(cell_cluster)
+
+# Write cluster
+write.csv(cell_cluster, "/Users/Desktop/MIBIclusters.csv")
+```
+
